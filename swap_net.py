@@ -1,122 +1,238 @@
 """
 SwapNet: SD-Turbo UNet 기반 face swap 생성 주체
-FaceNet: SwapNet 가중치 복사본, ref pixel-level ID feature 추출
+FaceNet: SwapNet 가중치 복사본, ref pixel-level ID feature 추출 후 SwapNet self-attention에 주입
+
+DreamID 논문 구조:
+  - FaceNet feature (h) + SwapNet feature (h) → concat (2h) → self-attention → 앞쪽 h만 SwapNet으로 전달
+  - ID Adapter feature → SwapNet cross-attention KV에 추가
 """
 
 import torch
 import torch.nn as nn
-from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers import UNet2DConditionModel
+from diffusers.models.attention_processor import Attention
 from copy import deepcopy
+from typing import Optional, List
 
 
-class SwapNet(nn.Module):
+# ─────────────────────────────────────────────
+# FaceNet feature를 self-attention에 주입하는 custom processor
+# ─────────────────────────────────────────────
+class FaceNetAttentionProcessor:
     """
-    SD-Turbo UNet 기반 SwapNet
-    입력 채널 4 → 8로 확장 (noisy latent 4 + target latent 4)
+    DreamID FaceNet feature injection:
+      self-attn: concat(facenet_feat, swapnet_feat) → self-attention → 앞쪽 절반만 사용
+      cross-attn: text + id_features → KV concat
     """
-    def __init__(self, unet: UNet2DConditionModel):
-        super().__init__()
-        self.unet = unet
-        self._expand_input_channels()
 
-    def _expand_input_channels(self):
-        """
-        UNet 첫 conv를 4채널 → 8채널로 확장
-        추가 4채널은 zero init (SD-Turbo pretrained 능력 보존)
-        """
-        old_conv = self.unet.conv_in
-        new_conv = nn.Conv2d(
-            8,
-            old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding
-        )
-        # 기존 가중치 복사
-        new_conv.weight.data[:, :4, :, :] = old_conv.weight.data
-        # 추가 4채널 zero init
-        new_conv.weight.data[:, 4:, :, :] = 0
-        new_conv.bias.data = old_conv.bias.data.clone()
-        self.unet.conv_in = new_conv
+    def __init__(self, layer_idx: int):
+        self.layer_idx = layer_idx
 
-    def forward(self, noisy_latent, target_latent, timestep, encoder_hidden_states, facenet_features=None):
-        """
-        Args:
-            noisy_latent: [B, 4, H, W] - t=999 노이즈
-            target_latent: [B, 4, H, W] - ε(B') VAE encoded
-            timestep: diffusion timestep (999)
-            encoder_hidden_states: text embedding "cinematic full head portrait"
-            facenet_features: FaceNet에서 추출한 pixel-level features (self-attention용)
-        """
-        # concat noisy + target → 8채널
-        x = torch.cat([noisy_latent, target_latent], dim=1)
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        facenet_features: Optional[List[torch.Tensor]] = None,
+        id_features: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
 
-        return self.unet(
-            x,
-            timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            cross_attention_kwargs={"facenet_features": facenet_features}
-        ).sample
+        is_cross_attention = encoder_hidden_states is not None
+
+        if is_cross_attention:
+            # ── Cross-attention: text + id_features KV concat ──
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
+
+            if id_features is not None:
+                id_key = attn.to_k(id_features)
+                id_value = attn.to_v(id_features)
+                key = torch.cat([key, id_key], dim=1)
+                value = torch.cat([value, id_value], dim=1)
+
+            query = attn.head_to_batch_dim(query)
+            key = attn.head_to_batch_dim(key)
+            value = attn.head_to_batch_dim(value)
+
+            attention_probs = attn.get_attention_scores(query, key, attention_mask)
+            hidden_states = torch.bmm(attention_probs, value)
+            hidden_states = attn.batch_to_head_dim(hidden_states)
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+
+        else:
+            # ── Self-attention: FaceNet feature concat ──
+            if (
+                facenet_features is not None
+                and self.layer_idx < len(facenet_features)
+                and facenet_features[self.layer_idx] is not None
+            ):
+                facenet_feat = facenet_features[self.layer_idx]
+                if facenet_feat.shape == hidden_states.shape:
+                    # [B, S, C] + [B, S, C] → [B, 2S, C]
+                    concat_states = torch.cat([hidden_states, facenet_feat], dim=1)
+                else:
+                    concat_states = hidden_states
+            else:
+                concat_states = hidden_states
+
+            # query는 swapnet hidden_states만, key/value는 concat
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(concat_states)
+            value = attn.to_v(concat_states)
+
+            query = attn.head_to_batch_dim(query)
+            key = attn.head_to_batch_dim(key)
+            value = attn.head_to_batch_dim(value)
+
+            attention_probs = attn.get_attention_scores(query, key, attention_mask)
+            hidden_states = torch.bmm(attention_probs, value)
+            hidden_states = attn.batch_to_head_dim(hidden_states)
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
 
 
+def register_facenet_processors(unet: UNet2DConditionModel):
+    """UNet의 모든 Attention layer에 FaceNetAttentionProcessor 등록"""
+    idx = 0
+    for name, module in unet.named_modules():
+        if isinstance(module, Attention):
+            module.set_processor(FaceNetAttentionProcessor(layer_idx=idx))
+            idx += 1
+
+
+# ─────────────────────────────────────────────
+# FaceNet: ref 이미지 → pixel-level feature 추출
+# ─────────────────────────────────────────────
 class FaceNet(nn.Module):
     """
-    SwapNet 가중치 복사본 (ReferenceNet)
-    ref A1 이미지 → pixel-level ID feature 추출
-    SwapNet self-attention에 주입
+    SwapNet UNet 가중치 복사본 (ReferenceNet 역할)
+    ref A1 → self-attention layer별 hidden_states 수집
     """
-    def __init__(self, swapnet: SwapNet):
+
+    def __init__(self, swapnet_unet: UNet2DConditionModel):
         super().__init__()
-        # SwapNet UNet encoder 부분만 복사
-        self.unet = deepcopy(swapnet.unet)
-        # FaceNet은 encoder half만 사용
-        # 입력 채널을 다시 4채널로 (ref 이미지만 받음)
+        self.unet = deepcopy(swapnet_unet)
         self._reset_input_channels()
 
     def _reset_input_channels(self):
-        """FaceNet은 ref 이미지 1장만 받으므로 4채널로 리셋"""
+        """FaceNet은 ref latent 4채널만 받음 (8채널 → 4채널)"""
         old_conv = self.unet.conv_in
         new_conv = nn.Conv2d(
             4,
             old_conv.out_channels,
             kernel_size=old_conv.kernel_size,
             stride=old_conv.stride,
-            padding=old_conv.padding
+            padding=old_conv.padding,
         )
-        # 원래 4채널 가중치 복사
+        # 8채널 중 앞 4채널만 복사
         new_conv.weight.data = old_conv.weight.data[:, :4, :, :].clone()
         new_conv.bias.data = old_conv.bias.data.clone()
         self.unet.conv_in = new_conv
 
-    def forward(self, ref_latent, timestep, encoder_hidden_states):
+    def forward(
+        self,
+        ref_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+    ) -> List[torch.Tensor]:
         """
-        Args:
-            ref_latent: [B, 4, H, W] - ε(A1) VAE encoded ref 이미지
-            timestep: diffusion timestep
-            encoder_hidden_states: text embedding
+        forward hook으로 각 self-attention의 input hidden_states 수집
         Returns:
-            pixel-level ID features (각 UNet block의 intermediate features)
+            features: List[Tensor] 각 self-attention layer의 hidden_states
         """
-        # UNet encoder 통과하며 intermediate features 수집
         features = []
+        hooks = []
 
-        # down blocks
-        down_block_res_samples = (ref_latent,)
-        for downsample_block in self.unet.down_blocks:
-            ref_latent, res_samples = downsample_block(
-                hidden_states=ref_latent,
-                temb=self.unet.get_time_embed(sample=ref_latent, timestep=timestep),
+        def make_hook():
+            def hook(module, args, kwargs_hook, output):
+                # self-attention (attn1)의 input hidden_states 저장
+                if args:
+                    features.append(args[0].clone())
+            return hook
+
+        for name, module in self.unet.named_modules():
+            if isinstance(module, Attention) and "attn1" in name:
+                hooks.append(
+                    module.register_forward_hook(make_hook(), with_kwargs=True)
+                )
+
+        with torch.no_grad():
+            self.unet(
+                ref_latent,
+                timestep,
                 encoder_hidden_states=encoder_hidden_states,
             )
-            down_block_res_samples += res_samples
-            features.append(ref_latent)
 
-        # mid block
-        ref_latent = self.unet.mid_block(
-            ref_latent,
-            self.unet.get_time_embed(sample=ref_latent, timestep=timestep),
-            encoder_hidden_states=encoder_hidden_states,
-        )
-        features.append(ref_latent)
+        for h in hooks:
+            h.remove()
 
         return features
+
+
+# ─────────────────────────────────────────────
+# SwapNet: face swap 생성 주체
+# ─────────────────────────────────────────────
+class SwapNet(nn.Module):
+    """
+    SD-Turbo UNet 기반 SwapNet
+    입력: [noisy(4ch) | ε(B')(4ch)] concat → 8채널
+    """
+
+    def __init__(self, unet: UNet2DConditionModel):
+        super().__init__()
+        self.unet = unet
+        self._expand_input_channels()
+        register_facenet_processors(self.unet)
+
+    def _expand_input_channels(self):
+        """conv_in: 4채널 → 8채널, 추가 4채널 zero init"""
+        old_conv = self.unet.conv_in
+        new_conv = nn.Conv2d(
+            8,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+        )
+        new_conv.weight.data[:, :4, :, :] = old_conv.weight.data.clone()
+        new_conv.weight.data[:, 4:, :, :] = 0.0
+        new_conv.bias.data = old_conv.bias.data.clone()
+        self.unet.conv_in = new_conv
+
+    def forward(
+        self,
+        noisy_latent: torch.Tensor,
+        target_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        facenet_features: Optional[List[torch.Tensor]] = None,
+        id_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            noisy_latent:          [B, 4, H, W] 순수 가우시안 노이즈 (t=999)
+            target_latent:         [B, 4, H, W] ε(B') VAE encoded
+            timestep:              [B] 999 고정
+            encoder_hidden_states: [B, seq, dim] text embedding
+            facenet_features:      List[Tensor] FaceNet self-attn hidden_states
+            id_features:           [B, num_tokens, dim] ID Adapter semantic features
+        Returns:
+            noise_pred: [B, 4, H, W]
+        """
+        x = torch.cat([noisy_latent, target_latent], dim=1)  # [B, 8, H, W]
+
+        return self.unet(
+            x,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs={
+                "facenet_features": facenet_features,
+                "id_features": id_features,
+            },
+        ).sample
