@@ -4,7 +4,7 @@ from insightface.app import FaceAnalysis
 
 app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider']);
 app.prepare(ctx_id=0, det_size=(640, 640))
-ROOT_DIR = "./vgg"
+ROOT_DIR = "../../mfvs_dataset"
 id_list, embs = [], []
 
 for id_n in tqdm(sorted(os.listdir(ROOT_DIR)), desc="Embedding Bank"):

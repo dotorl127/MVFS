@@ -22,7 +22,7 @@ from utils.swap_func import run_inference
 # ==========================================
 
 # 1. 경로 설정
-METADATA_PATH = "final_train_metadata.csv"
+METADATA_PATH = "metadata.csv"
 MATCH_MAP_PATH = "match_map.json"
 ROOT_DIR = "./vgg"
 # FaceDancer 모델 가중치 경로 (허깅페이스에서 다운받은 h5 파일)

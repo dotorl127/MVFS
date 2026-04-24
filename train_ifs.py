@@ -45,10 +45,10 @@ import insightface
 from insightface.app import FaceAnalysis
 
 sys.path.append(str(Path(__file__).parent.parent))
-from models.swap_net import SwapNet
-from models.id_adapter import IDAdapter
-from utils.losses import TotalLoss
-from data.dataset_image import get_dataloader
+from swap_net import SwapNet
+from id_adapter import IDAdapter
+from losses import TotalLoss
+from dataset_image import get_dataloader
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
