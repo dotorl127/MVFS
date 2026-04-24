@@ -22,24 +22,24 @@ class IDAdapter(nn.Module):
         """
         super().__init__()
         self.num_tokens = num_tokens
+        self.id_embed_dim = id_embed_dim
 
-        self.proj = nn.Sequential(
-            nn.Linear(id_embed_dim, id_embed_dim * num_tokens),
-            nn.LayerNorm(id_embed_dim * num_tokens),
-        )
-        self.to_kv = nn.Linear(id_embed_dim, cross_attention_dim)
+        # [B, 512] → [B, num_tokens * cross_attention_dim]
+        self.proj = nn.Linear(id_embed_dim, num_tokens * cross_attention_dim)
+        self.norm = nn.LayerNorm(cross_attention_dim)
 
-    def forward(self, id_embedding):
+    def forward(self, id_embedding: torch.Tensor) -> torch.Tensor:
         """
         Args:
             id_embedding: [B, 512] ArcFace embedding
         Returns:
-            semantic_id_features: [B, num_tokens, cross_attention_dim]
+            [B, num_tokens, cross_attention_dim]
         """
-        # [B, 512] → [B, 512 * num_tokens]
+        # [B, 512] → [B, num_tokens * cross_attention_dim]
         x = self.proj(id_embedding)
-        # [B, 512 * num_tokens] → [B, num_tokens, 512]
-        x = x.view(-1, self.num_tokens, id_embedding.shape[-1])
-        # [B, num_tokens, cross_attention_dim]
-        x = self.to_kv(x)
+        # [B, num_tokens * cross_attention_dim] → [B, num_tokens, cross_attention_dim]
+        B = id_embedding.shape[0]
+        cross_dim = x.shape[-1] // self.num_tokens
+        x = x.view(B, self.num_tokens, cross_dim)
+        x = self.norm(x)
         return x

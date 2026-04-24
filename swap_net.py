@@ -112,16 +112,23 @@ def register_facenet_processors(unet: UNet2DConditionModel):
 class FaceNet(nn.Module):
     """
     SwapNet UNet 가중치 복사본 (ReferenceNet 역할)
-    ref A1 → self-attention layer별 hidden_states 수집
+    ref A1 → self-attention layer별 hidden_states 수집 후 SwapNet에 주입
+    FaceNet 자체도 학습 대상 (논문에서 Train 표시)
     """
 
-    def __init__(self, swapnet_unet: UNet2DConditionModel):
+    def __init__(self, swapnet: "SwapNet"):
+        """
+        Args:
+            swapnet: 이미 _expand_input_channels된 SwapNet 인스턴스
+                     SwapNet.unet (8채널) 을 deepcopy 후 4채널로 리셋
+        """
         super().__init__()
-        self.unet = deepcopy(swapnet_unet)
+        # SwapNet의 8채널 UNet을 복사 후 4채널로 리셋
+        self.unet = deepcopy(swapnet.unet)
         self._reset_input_channels()
 
     def _reset_input_channels(self):
-        """FaceNet은 ref latent 4채널만 받음 (8채널 → 4채널)"""
+        """FaceNet은 ref latent 4채널만 받음 (8채널 conv_in → 4채널)"""
         old_conv = self.unet.conv_in
         new_conv = nn.Conv2d(
             4,
@@ -130,7 +137,7 @@ class FaceNet(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding,
         )
-        # 8채널 중 앞 4채널만 복사
+        # 8채널 중 앞 4채널 가중치만 복사
         new_conv.weight.data = old_conv.weight.data[:, :4, :, :].clone()
         new_conv.bias.data = old_conv.bias.data.clone()
         self.unet.conv_in = new_conv
@@ -142,32 +149,31 @@ class FaceNet(nn.Module):
         encoder_hidden_states: torch.Tensor,
     ) -> List[torch.Tensor]:
         """
-        forward hook으로 각 self-attention의 input hidden_states 수집
+        forward hook으로 각 self-attention (attn1) 의 input hidden_states 수집
+        FaceNet은 학습 가능하므로 no_grad 없이 실행
+
         Returns:
-            features: List[Tensor] 각 self-attention layer의 hidden_states
+            features: List[Tensor] — attn1 레이어 순서대로 hidden_states
         """
         features = []
         hooks = []
 
         def make_hook():
-            def hook(module, args, kwargs_hook, output):
-                # self-attention (attn1)의 input hidden_states 저장
+            def hook(module, args, output):
+                # Attention.__call__ 의 첫 번째 positional arg = hidden_states
                 if args:
-                    features.append(args[0].clone())
+                    features.append(args[0])  # gradient 유지 (clone 제거)
             return hook
 
         for name, module in self.unet.named_modules():
             if isinstance(module, Attention) and "attn1" in name:
-                hooks.append(
-                    module.register_forward_hook(make_hook(), with_kwargs=True)
-                )
+                hooks.append(module.register_forward_hook(make_hook()))
 
-        with torch.no_grad():
-            self.unet(
-                ref_latent,
-                timestep,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+        self.unet(
+            ref_latent,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
 
         for h in hooks:
             h.remove()
@@ -189,6 +195,13 @@ class SwapNet(nn.Module):
         self.unet = unet
         self._expand_input_channels()
         register_facenet_processors(self.unet)
+
+    def build_facenet(self) -> "FaceNet":
+        """
+        SwapNet 초기화 완료 후 FaceNet 생성
+        반드시 SwapNet 생성 후 호출: facenet = swapnet.build_facenet()
+        """
+        return FaceNet(self)
 
     def _expand_input_channels(self):
         """conv_in: 4채널 → 8채널, 추가 4채널 zero init"""

@@ -45,7 +45,7 @@ import insightface
 from insightface.app import FaceAnalysis
 
 sys.path.append(str(Path(__file__).parent.parent))
-from models.swap_net import SwapNet, FaceNet
+from models.swap_net import SwapNet
 from models.id_adapter import IDAdapter
 from utils.losses import TotalLoss
 from data.dataset_image import get_dataloader
@@ -89,8 +89,8 @@ def setup_models(args, device):
     swapnet = SwapNet(unet).to(device)
     swapnet.unet.enable_gradient_checkpointing()
 
-    # FaceNet (SwapNet 가중치 복사)
-    facenet = FaceNet(swapnet).to(device)
+    # FaceNet: SwapNet 가중치 복사 (반드시 SwapNet 생성 후)
+    facenet = swapnet.build_facenet().to(device)
     facenet.unet.enable_gradient_checkpointing()
 
     # ID Adapter
@@ -391,14 +391,24 @@ def train(args):
                 gen_id_embed = get_id_embedding(models["face_app"], gen_np).to(device)
 
                 # 9. Loss 계산
-                # diffusion loss: noise_pred vs noise (epsilon prediction)
+                # SD-Turbo prediction_type 확인 후 올바른 target 사용
+                pred_type = models["noise_scheduler"].config.prediction_type
+                if pred_type == "v_prediction":
+                    noise_target = models["noise_scheduler"].get_velocity(
+                        a2_latent, noise, timesteps
+                    )
+                elif pred_type == "epsilon":
+                    noise_target = noise
+                else:
+                    noise_target = a2_latent
+
                 losses = criterion(
                     generated=generated,
                     gt=a2,
                     generated_embedding=gen_id_embed,
                     source_embedding=a1_id_embed,
                     noise_pred=noise_pred,
-                    noise_target=noise,
+                    noise_target=noise_target,
                 )
 
                 loss = losses["total"] / args.grad_accum
