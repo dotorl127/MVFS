@@ -11,17 +11,21 @@ from tqdm import tqdm
 # ==========================================
 import tensorflow as tf
 from tensorflow.keras.models import load_model
-
-try:
-    from tensorflow_addons.layers import InstanceNormalization
-except ImportError:
-    print("tensorflow-addons가 설치되지 않았습니다. (pip install tensorflow-addons)")
 from networks.layers import AdaIN, AdaptiveAttention
 from retinaface.models import *
 from utils.swap_func import run_inference
 from utils.utils import (estimate_norm, get_lm, inverse_estimate_norm,
                          norm_crop, transform_landmark_points)
 from scipy.ndimage import gaussian_filter
+
+'''
+Locate this file into facedaner root directory
+'''
+
+try:
+    from tensorflow_addons.layers import InstanceNormalization
+except ImportError:
+    print("tensorflow-addons가 설치되지 않았습니다. (pip install tensorflow-addons)")
 
 # ==========================================
 
