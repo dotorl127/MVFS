@@ -17,18 +17,22 @@ try:
 except ImportError:
     print("tensorflow-addons가 설치되지 않았습니다. (pip install tensorflow-addons)")
 from networks.layers import AdaIN, AdaptiveAttention
+from retinaface.models import *
 from utils.swap_func import run_inference
+from utils.utils import (estimate_norm, get_lm, inverse_estimate_norm,
+                         norm_crop, transform_landmark_points)
+from scipy.ndimage import gaussian_filter
 
 # ==========================================
 
 # 1. 경로 설정
-METADATA_PATH = "metadata.csv"
-MATCH_MAP_PATH = "match_map.json"
-ROOT_DIR = "./vgg"
+METADATA_PATH = "../mfvs_dataset/metadata.csv"
+MATCH_MAP_PATH = "../mfvs_dataset/match_map.json"
+ROOT_DIR = "../mfvs_dataset"
 # FaceDancer 모델 가중치 경로 (허깅페이스에서 다운받은 h5 파일)
 MODEL_PATH = "./model_zoo/FaceDancer_config_c_HQ.h5"
-AF_MODEL_PATH = "./acrface/"
-R_MODEL_PATH = "./retinaface/"
+AF_MODEL_PATH = "./arcface_model/ArcFace-Res50.h5"
+R_MODEL_PATH = "./retinaface/RetinaFace-Res50.h5"
 
 df = pd.read_csv(METADATA_PATH)
 with open(MATCH_MAP_PATH, 'r') as f:

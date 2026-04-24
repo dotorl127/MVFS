@@ -33,4 +33,4 @@ for i, s_id in enumerate(id_list):
 
     match_map[s_id] = {"hard": hard, "semi_hard": semi, "easy": easy}
 
-with open("match_map.json", "w") as f: json.dump(match_map, f, indent=4)
+with open("../../mfvs_dataset/match_map.json", "w") as f: json.dump(match_map, f, indent=4)
