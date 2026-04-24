@@ -87,9 +87,11 @@ def setup_models(args, device):
         args.pretrained_model, subfolder="unet"
     )
     swapnet = SwapNet(unet).to(device)
+    swapnet.unet.enable_gradient_checkpointing()
 
     # FaceNet (SwapNet 가중치 복사)
     facenet = FaceNet(swapnet).to(device)
+    facenet.unet.enable_gradient_checkpointing()
 
     # ID Adapter
     id_adapter = IDAdapter(
