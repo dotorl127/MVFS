@@ -11,20 +11,14 @@ import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
 from diffusers.models.attention_processor import Attention
+import xformers.ops as xops
 from copy import deepcopy
 from typing import Optional, List
-
 
 # ─────────────────────────────────────────────
 # FaceNet feature를 self-attention에 주입하는 custom processor
 # ─────────────────────────────────────────────
 class FaceNetAttentionProcessor:
-    """
-    DreamID FaceNet feature injection:
-      self-attn: concat(facenet_feat, swapnet_feat) → self-attention → 앞쪽 절반만 사용
-      cross-attn: text + id_features → KV concat
-    """
-
     def __init__(self, layer_idx: int):
         self.layer_idx = layer_idx
 
@@ -39,10 +33,11 @@ class FaceNetAttentionProcessor:
         **kwargs,
     ) -> torch.Tensor:
 
+        USE_XFORMERS = True
+
         is_cross_attention = encoder_hidden_states is not None
 
         if is_cross_attention:
-            # ── Cross-attention: text + id_features KV concat ──
             query = attn.to_q(hidden_states)
             key = attn.to_k(encoder_hidden_states)
             value = attn.to_v(encoder_hidden_states)
@@ -57,14 +52,18 @@ class FaceNetAttentionProcessor:
             key = attn.head_to_batch_dim(key)
             value = attn.head_to_batch_dim(value)
 
-            attention_probs = attn.get_attention_scores(query, key, attention_mask)
-            hidden_states = torch.bmm(attention_probs, value)
+            if USE_XFORMERS:
+                # xformers: [B*heads, S, head_dim] → [B*heads, S, head_dim]
+                hidden_states = xops.memory_efficient_attention(query, key, value)
+            else:
+                attention_probs = attn.get_attention_scores(query, key, attention_mask)
+                hidden_states = torch.bmm(attention_probs, value)
+
             hidden_states = attn.batch_to_head_dim(hidden_states)
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)
 
         else:
-            # ── Self-attention: FaceNet feature concat ──
             if (
                 facenet_features is not None
                 and self.layer_idx < len(facenet_features)
@@ -72,14 +71,12 @@ class FaceNetAttentionProcessor:
             ):
                 facenet_feat = facenet_features[self.layer_idx]
                 if facenet_feat.shape == hidden_states.shape:
-                    # [B, S, C] + [B, S, C] → [B, 2S, C]
                     concat_states = torch.cat([hidden_states, facenet_feat], dim=1)
                 else:
                     concat_states = hidden_states
             else:
                 concat_states = hidden_states
 
-            # query는 swapnet hidden_states만, key/value는 concat
             query = attn.to_q(hidden_states)
             key = attn.to_k(concat_states)
             value = attn.to_v(concat_states)
@@ -88,8 +85,12 @@ class FaceNetAttentionProcessor:
             key = attn.head_to_batch_dim(key)
             value = attn.head_to_batch_dim(value)
 
-            attention_probs = attn.get_attention_scores(query, key, attention_mask)
-            hidden_states = torch.bmm(attention_probs, value)
+            if USE_XFORMERS:
+                hidden_states = xops.memory_efficient_attention(query, key, value)
+            else:
+                attention_probs = attn.get_attention_scores(query, key, attention_mask)
+                hidden_states = torch.bmm(attention_probs, value)
+
             hidden_states = attn.batch_to_head_dim(hidden_states)
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)

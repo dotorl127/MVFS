@@ -14,15 +14,15 @@ python training/train_ifs.py \
 """
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import argparse
 import logging
 from pathlib import Path
 
 import torch
-import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torchvision.utils import save_image
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 from tqdm import tqdm
 
@@ -41,7 +41,6 @@ from diffusers import (
 )
 from diffusers.models import AutoencoderKL
 import open_clip
-import insightface
 from insightface.app import FaceAnalysis
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -60,13 +59,14 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--pretrained_model", type=str, default="stabilityai/sd-turbo")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max_steps", type=int, default=70000)
     parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--log_steps", type=int, default=100)
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--preview_steps", type=int, default=20)
+    parser.add_argument("--log_steps", type=int, default=50)
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--mixed_precision", action="store_true", default=True)
     parser.add_argument("--resume_from", type=str, default=None)
     return parser.parse_args()
@@ -88,10 +88,14 @@ def setup_models(args, device):
     )
     swapnet = SwapNet(unet).to(device)
     swapnet.unet.enable_gradient_checkpointing()
+    # swapnet.unet.enable_xformers_memory_efficient_attention()
 
     # FaceNet: SwapNet 가중치 복사 (반드시 SwapNet 생성 후)
     facenet = swapnet.build_facenet().to(device)
     facenet.unet.enable_gradient_checkpointing()
+    # facenet.unet.enable_xformers_memory_efficient_attention()
+    for param in facenet.parameters():
+        param.requires_grad_(False)
 
     # ID Adapter
     id_adapter = IDAdapter(
@@ -114,6 +118,7 @@ def setup_models(args, device):
     logger.info("Loading InsightFace...")
     face_app = FaceAnalysis(
         name='buffalo_l',
+        allowed_modules=['detection', 'recognition'],
         providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
     )
     face_app.prepare(ctx_id=0, det_size=(512, 512))
@@ -178,7 +183,8 @@ def decode_latent(vae, latent, no_grad: bool = False):
         with torch.no_grad():
             image = vae.decode(latent).sample
     else:
-        image = vae.decode(latent).sample
+        # image = vae.decode(latent).sample
+        image = checkpoint(vae.decode, latent, use_reentrant=False).sample
     return image
 
 
@@ -192,9 +198,9 @@ def setup_optimizer(models, lr, use_8bit=True):
         param.requires_grad_(True)
         trainable_params.append(param)
 
-    for name, param in models["facenet"].named_parameters():
-        param.requires_grad_(True)
-        trainable_params.append(param)
+    # for name, param in models["facenet"].named_parameters():
+    #     param.requires_grad_(True)
+    #     trainable_params.append(param)
 
     for name, param in models["id_adapter"].named_parameters():
         param.requires_grad_(True)
@@ -234,6 +240,7 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     a1 = batch["a1"][:1].to(device)
     a2 = batch["a2"][:1].to(device)
     b_prime = batch["b_prime"][:1].to(device)
+    B = a1.shape[0]
 
     # VAE encode
     a1_latent = encode_image(vae, a1)
@@ -241,7 +248,7 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
 
     # Noisy latent (t=999 순수 가우시안)
     noisy_latent = torch.randn_like(b_latent)
-    timesteps = torch.full((1,), 999, dtype=torch.long, device=device)
+    timesteps = torch.full((B,), 999, dtype=torch.long, device=device)
 
     # ID embedding
     a1_np = ((a1.cpu().permute(0, 2, 3, 1).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
@@ -249,11 +256,18 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     id_features = models["id_adapter"](a1_id_embed)
 
     # FaceNet features
-    facenet_features = models["facenet"](
-        a1_latent,
-        timesteps,
-        text_embedding.expand(1, -1, -1),
-    )
+    # facenet_features = models["facenet"](
+    #     a1_latent,
+    #     timesteps,
+    #     text_embedding.expand(1, -1, -1),
+    # )
+    with torch.no_grad():
+        facenet_features = models["facenet"](
+            a1_latent,
+            timesteps,
+            text_embedding.expand(B, -1, -1),
+        )
+    facenet_features = [f.detach() for f in facenet_features]
 
     # SwapNet forward — id_features 반드시 전달
     noise_pred = models["swapnet"](
@@ -300,7 +314,8 @@ def train(args):
     optimizer = setup_optimizer(models, args.lr)
 
     # Mixed precision
-    scaler = GradScaler() if args.mixed_precision else None
+    use_amp = args.mixed_precision and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     # 데이터로더
     dataloader = get_dataloader(
@@ -343,7 +358,7 @@ def train(args):
             a2 = batch["a2"].to(device)      # [B, 3, H, W] GT
             b_prime = batch["b_prime"].to(device)  # [B, 3, H, W] 가짜 타겟
 
-            with autocast(enabled=args.mixed_precision):
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
 
                 # 1. VAE encode (no_grad: VAE는 freeze)
                 a1_latent = encode_image(models["vae"], a1)       # ε(A1)
@@ -356,17 +371,29 @@ def train(args):
                 noisy_latent = noise                              # t=999 → 완전 노이즈
                 timesteps = torch.full((B,), 999, dtype=torch.long, device=device)
 
-                # 3. ID embedding (A1) — no_grad: InsightFace freeze
-                a1_np = ((a1.cpu().permute(0, 2, 3, 1).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-                a1_id_embed = get_id_embedding(models["face_app"], a1_np).to(device)  # [B, 512]
+                # 3. ID embedding (A1) — 캐싱된 embedding 사용, fallback 시 InsightFace 호출
+                if batch["a1_embedding"].abs().sum() > 0:
+                    # 캐싱된 embedding 사용 (빠름)
+                    a1_id_embed = batch["a1_embedding"].to(device)  # [B, 512]
+                else:
+                    # fallback: InsightFace 직접 호출 (.npy 없을 때)
+                    a1_np = ((a1.cpu().permute(0, 2, 3, 1).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+                    a1_id_embed = get_id_embedding(models["face_app"], a1_np).to(device)
                 id_features = models["id_adapter"](a1_id_embed)   # [B, num_tokens, dim]
 
                 # 4. FaceNet: A1 pixel-level features (no_grad 내부 처리)
-                facenet_features = models["facenet"](
-                    a1_latent,
-                    timesteps,
-                    text_embedding.expand(B, -1, -1),
-                )  # List[Tensor]
+                # facenet_features = models["facenet"](
+                #     a1_latent,
+                #     timesteps,
+                #     text_embedding.expand(B, -1, -1),
+                # )
+                with torch.no_grad():
+                    facenet_features = models["facenet"](
+                        a1_latent,
+                        timesteps,
+                        text_embedding.expand(B, -1, -1),
+                    )
+                facenet_features = [f.detach() for f in facenet_features]
 
                 # 5. SwapNet forward — id_features 반드시 전달
                 noise_pred = models["swapnet"](
@@ -468,6 +495,7 @@ def train(args):
                 }, save_path)
                 logger.info(f"Saved checkpoint: {save_path}")
 
+            if global_step % args.preview_steps == 0:
                 run_validation(
                     models=models,
                     vae=models["vae"],

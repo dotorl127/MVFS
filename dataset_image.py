@@ -27,6 +27,7 @@ import os
 import random
 from pathlib import Path
 from PIL import Image
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -35,7 +36,7 @@ from torchvision import transforms
 class TripletDataset(Dataset):
     """
     (A1, B', A2) triplet 데이터셋
-    
+
     A1: 대표 이미지 1장 (ref)
     B': 가짜 타겟 (타인을 소스로 A2에 스왑한 결과)
     A2: GT 이미지 (멀티앵글)
@@ -146,8 +147,19 @@ class TripletDataset(Dataset):
             "a1": a1,           # ref 이미지
             "a2": a2,           # GT 이미지
             "b_prime": b_prime, # 가짜 타겟
-            "identity": sample["identity"]
+            "identity": sample["identity"],
+            "a1_embedding": self._load_a1_embedding(sample["a1"]),  # 캐싱된 ID embedding
         }
+
+    def _load_a1_embedding(self, a1_path: Path) -> torch.Tensor:
+        """
+        A1 이미지와 같은 경로의 .npy 파일에서 ArcFace embedding 로드
+        없으면 zero tensor 반환 (학습 루프에서 fallback 처리)
+        """
+        npy_path = a1_path.with_suffix('.npy')
+        if npy_path.exists():
+            return torch.tensor(np.load(npy_path), dtype=torch.float32)
+        return torch.zeros(512, dtype=torch.float32)  # fallback
 
 
 def get_dataloader(root_dir, batch_size=1, image_size=512,

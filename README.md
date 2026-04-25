@@ -59,6 +59,8 @@ dataset/
 ## 설치
 ```bash
 pip install -r requirements.txt
+uv pip install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu121
+uv pip install "diffusers>=0.29.0,<0.31.0"
 ```
 
 ## 1단계 학습 실행
@@ -72,6 +74,8 @@ python training/train_ifs.py \
     --max_steps 70000 \
     --save_steps 1000 \
     --mixed_precision
+    
+python .\train_ifs.py --data_dir ..\mfvs_dataset --output_dir .\checkpoints --mixed_precision
 ```
 
 ## RTX 3060 12GB 최적화 설정
