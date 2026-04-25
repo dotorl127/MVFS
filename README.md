@@ -96,6 +96,16 @@ python training/train_ifs.py \
     --mixed_precision
 ```
 
+## LoRA 파인튜닝
+```bash
+python train_lora.py \
+    --data_dir ../finetune_dataset \
+    --base_checkpoint ./checkpoints/checkpoint_XXXXX.pt \
+    --lora_rank 32 \
+    --lr 5e-6 \
+    --max_steps 2000
+```
+
 ## Loss 모니터링
 ```
 Step 100 | total: 12.3456 | rec: 10.1234 | id: 0.9876 | dm: 1.2345

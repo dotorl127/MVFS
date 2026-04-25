@@ -59,12 +59,12 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--pretrained_model", type=str, default="stabilityai/sd-turbo")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max_steps", type=int, default=70000)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--preview_steps", type=int, default=20)
-    parser.add_argument("--log_steps", type=int, default=50)
+    parser.add_argument("--log_steps", type=int, default=40)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--mixed_precision", action="store_true", default=True)
@@ -88,14 +88,13 @@ def setup_models(args, device):
     )
     swapnet = SwapNet(unet).to(device)
     swapnet.unet.enable_gradient_checkpointing()
-    # swapnet.unet.enable_xformers_memory_efficient_attention()
 
     # FaceNet: SwapNet 가중치 복사 (반드시 SwapNet 생성 후)
-    facenet = swapnet.build_facenet().to(device)
-    facenet.unet.enable_gradient_checkpointing()
-    # facenet.unet.enable_xformers_memory_efficient_attention()
-    for param in facenet.parameters():
-        param.requires_grad_(False)
+    # facenet = swapnet.build_facenet().to(device)
+    # facenet.unet.enable_gradient_checkpointing()
+    # for param in facenet.parameters():
+    #     param.requires_grad_(False)
+    facenet = None
 
     # ID Adapter
     id_adapter = IDAdapter(
@@ -234,7 +233,7 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     A1(ref) | B'(가짜타겟) | Generated | A2(GT) 순으로 저장
     """
     models["swapnet"].eval()
-    models["facenet"].eval()
+    # models["facenet"].eval()
     models["id_adapter"].eval()
 
     a1 = batch["a1"][:1].to(device)
@@ -261,13 +260,14 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     #     timesteps,
     #     text_embedding.expand(1, -1, -1),
     # )
-    with torch.no_grad():
-        facenet_features = models["facenet"](
-            a1_latent,
-            timesteps,
-            text_embedding.expand(B, -1, -1),
-        )
-    facenet_features = [f.detach() for f in facenet_features]
+    # with torch.no_grad():
+    #     facenet_features = models["facenet"](
+    #         a1_latent,
+    #         timesteps,
+    #         text_embedding.expand(B, -1, -1),
+    #     )
+    # facenet_features = [f.detach() for f in facenet_features]
+    facenet_features = None
 
     # SwapNet forward — id_features 반드시 전달
     noise_pred = models["swapnet"](
@@ -289,7 +289,7 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     save_image(grid * 0.5 + 0.5, os.path.join(save_dir, f"val_{step:07d}.png"), nrow=4)
 
     models["swapnet"].train()
-    models["facenet"].train()
+    # models["facenet"].train()
     models["id_adapter"].train()
 
 
@@ -333,7 +333,7 @@ def train(args):
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
         models["swapnet"].load_state_dict(checkpoint["swapnet"])
-        models["facenet"].load_state_dict(checkpoint["facenet"])
+        # models["facenet"].load_state_dict(checkpoint["facenet"])
         models["id_adapter"].load_state_dict(checkpoint["id_adapter"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         global_step = checkpoint["step"]
@@ -341,7 +341,7 @@ def train(args):
 
     # 학습 루프
     models["swapnet"].train()
-    models["facenet"].train()
+    # models["facenet"].train()
     models["id_adapter"].train()
 
     optimizer.zero_grad()
@@ -382,18 +382,14 @@ def train(args):
                 id_features = models["id_adapter"](a1_id_embed)   # [B, num_tokens, dim]
 
                 # 4. FaceNet: A1 pixel-level features (no_grad 내부 처리)
-                # facenet_features = models["facenet"](
-                #     a1_latent,
-                #     timesteps,
-                #     text_embedding.expand(B, -1, -1),
-                # )
-                with torch.no_grad():
-                    facenet_features = models["facenet"](
-                        a1_latent,
-                        timesteps,
-                        text_embedding.expand(B, -1, -1),
-                    )
-                facenet_features = [f.detach() for f in facenet_features]
+                # with torch.no_grad():
+                #     facenet_features = models["facenet"](
+                #         a1_latent,
+                #         timesteps,
+                #         text_embedding.expand(B, -1, -1),
+                #     )
+                # facenet_features = [f.detach() for f in facenet_features]
+                facenet_features = None
 
                 # 5. SwapNet forward — id_features 반드시 전달
                 noise_pred = models["swapnet"](
@@ -456,7 +452,7 @@ def train(args):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         list(models["swapnet"].parameters()) +
-                        list(models["facenet"].parameters()) +
+                        # list(models["facenet"].parameters()) +
                         list(models["id_adapter"].parameters()),
                         1.0
                     )
@@ -465,7 +461,7 @@ def train(args):
                 else:
                     torch.nn.utils.clip_grad_norm_(
                         list(models["swapnet"].parameters()) +
-                        list(models["facenet"].parameters()) +
+                        # list(models["facenet"].parameters()) +
                         list(models["id_adapter"].parameters()),
                         1.0
                     )
@@ -489,7 +485,7 @@ def train(args):
                 torch.save({
                     "step": global_step,
                     "swapnet": models["swapnet"].state_dict(),
-                    "facenet": models["facenet"].state_dict(),
+                    # "facenet": models["facenet"].state_dict(),
                     "id_adapter": models["id_adapter"].state_dict(),
                     "optimizer": optimizer.state_dict(),
                 }, save_path)
