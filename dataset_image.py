@@ -102,7 +102,7 @@ class TripletDataset(Dataset):
                     continue
 
                 # 해당 A2에 대응하는 B_ 디렉토리
-                b_subdir = b_dir / a2_img.stem
+                b_subdir = b_dir / a2_img.stem #/ 'trash'
                 if not b_subdir.exists():
                     continue
 
