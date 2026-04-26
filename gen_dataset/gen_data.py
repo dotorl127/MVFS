@@ -5,7 +5,6 @@ import cv2
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from insightface.app import FaceAnalysis
 
 # ==========================================
 # FaceDancer 의존성 임포트
@@ -38,26 +37,17 @@ ROOT_DIR = "../mfvs_dataset"
 MODEL_PATH = "./model_zoo/FaceDancer_config_c_HQ.h5"
 AF_MODEL_PATH = "./arcface_model/ArcFace-Res50.h5"
 R_MODEL_PATH = "./retinaface/RetinaFace-Res50.h5"
-
-MAX_POSE_DIST = 45.0      # 포즈 거리 최대 허용값 (도 단위)
-SIM_THRESHOLD = 0.7       # B'와 A2 유사도 threshold (이상이면 trash로 분류)
+MAX_POSE_DIST = 45.0  # 포즈 거리 최대 허용값
 
 df = pd.read_csv(METADATA_PATH)
 with open(MATCH_MAP_PATH, 'r') as f:
     match_map = json.load(f)
 
-# InsightFace (유사도 필터링용)
-face_app = FaceAnalysis(
-    name='buffalo_l',
-    allowed_modules=['detection', 'recognition'],
-    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-)
-face_app.prepare(ctx_id=0, det_size=(512, 512))
-
 
 def find_best_angle_target_a2(source_pose, target_id):
     target_a2_candidates = df[(df['id'] == target_id) & (df['folder_type'] == 'A2')]
-    if target_a2_candidates.empty: return None
+    if target_a2_candidates.empty:
+        return None
 
     target_a2_candidates = target_a2_candidates.copy()
     target_a2_candidates['pose_dist'] = (
@@ -65,31 +55,14 @@ def find_best_angle_target_a2(source_pose, target_id):
         (target_a2_candidates['yaw'] - source_pose['yaw']) ** 2
     ) ** 0.5
 
+    # 가장 가까운 각도 선택
     best = target_a2_candidates.sort_values('pose_dist').iloc[0]
 
-    # 포즈 차이가 너무 크면 스킵
+    # threshold 초과 시 None 반환 → 해당 쌍 스킵
     if best['pose_dist'] > MAX_POSE_DIST:
         return None
 
     return best
-
-
-def get_embedding(img):
-    """numpy 이미지에서 ArcFace embedding 추출"""
-    faces = face_app.get(cv2.copyMakeBorder(img, 30, 30, 30, 30, cv2.BORDER_CONSTANT))
-    if faces:
-        return faces[0].normed_embedding
-    return None
-
-
-def is_too_similar(swapped_img, background_img):
-    """B'가 A2(background)와 너무 비슷한지 확인"""
-    emb_swapped = get_embedding(swapped_img)
-    emb_background = get_embedding(background_img)
-    if emb_swapped is None or emb_background is None:
-        return False
-    sim = float(np.dot(emb_swapped, emb_background))
-    return sim >= SIM_THRESHOLD
 
 
 def run_multi_angle_swapping():
@@ -203,16 +176,9 @@ def run_multi_angle_swapping():
 
                     # 반환된 이미지가 정상이라면 저장
                     if total_img is not None:
+                        # run_inference가 RGB를 반환할 경우 cv2.cvtColor(face_swap, cv2.COLOR_RGB2BGR) 필요
                         total_img = cv2.cvtColor(total_img, cv2.COLOR_RGB2BGR)
-
-                        # B'와 A2 유사도 체크 → 너무 비슷하면 trash로 분류
-                        background_img_bgr = cv2.imread(background_img_path)
-                        if is_too_similar(total_img, background_img_bgr):
-                            trash_dir = os.path.join(save_dir, "trash")
-                            os.makedirs(trash_dir, exist_ok=True)
-                            cv2.imwrite(os.path.join(trash_dir, save_name), total_img)
-                        else:
-                            cv2.imwrite(save_path, total_img)
+                        cv2.imwrite(save_path, total_img)
                 except Exception as e:
                     print(f"\n[Error] {face_img_path} -> {background_img_path} 합성 실패: {e}")
 
