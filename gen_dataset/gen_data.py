@@ -37,7 +37,7 @@ ROOT_DIR = "../mfvs_dataset"
 MODEL_PATH = "./model_zoo/FaceDancer_config_c_HQ.h5"
 AF_MODEL_PATH = "./arcface_model/ArcFace-Res50.h5"
 R_MODEL_PATH = "./retinaface/RetinaFace-Res50.h5"
-MAX_POSE_DIST = 45.0  # 포즈 거리 최대 허용값
+MAX_POSE_DIST = 20.0  # 포즈 거리 최대 허용값
 
 df = pd.read_csv(METADATA_PATH)
 with open(MATCH_MAP_PATH, 'r') as f:
