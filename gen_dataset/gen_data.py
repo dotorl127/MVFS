@@ -13,7 +13,6 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from networks.layers import AdaIN, AdaptiveAttention
 from retinaface.models import *
-from utils.swap_func import run_inference
 from utils.utils import (estimate_norm, get_lm, inverse_estimate_norm,
                          norm_crop, transform_landmark_points)
 from scipy.ndimage import gaussian_filter
@@ -136,20 +135,6 @@ def run_multi_angle_swapping():
 
                     mask = np.zeros((256, 256), dtype=np.float32)
 
-                    # 2. 5개 랜드마크 포인트를 둘러싸는 다각형(Convex Hull) 채우기
-                    points = transformed_lmk.astype(np.int32)
-                    hull = cv2.convexHull(points)
-                    cv2.fillConvexPoly(mask, hull, 1.0)
-
-                    # 3. 눈, 코, 입만 덮고 있으므로 이마와 턱을 덮기 위해 마스크 팽창(Dilation)
-                    # ※ 합성 결과의 테두리가 어색하면 kernel 크기(현재 50x50)를 조절하세요.
-                    kernel = np.ones((50, 50), np.uint8)
-                    mask = cv2.dilate(mask, kernel, iterations=1)
-
-                    # 4. 가우시안 블러로 자연스러운 경계선(페더링) 처리
-                    blend_mask_base = gaussian_filter(mask, sigma=12)
-                    blend_mask_base = np.expand_dims(blend_mask_base, axis=-1)
-
                     im = cv2.cvtColor(target, cv2.COLOR_RGB2BGR)
                     im_h, im_w, _ = im.shape
                     im_shape = (im_w, im_h)
@@ -177,6 +162,20 @@ def run_multi_angle_swapping():
                         # warp image back
                         iM, _ = inverse_estimate_norm(lm_align, transformed_lmk, 256, "arcface", shrink_factor=1.0)
                         iim_aligned = cv2.warpAffine(face_swap, iM, im_shape, borderValue=0.0)
+
+                        # 2. 5개 랜드마크 포인트를 둘러싸는 다각형(Convex Hull) 채우기
+                        points = transformed_lmk.astype(np.int32)
+                        hull = cv2.convexHull(points)
+                        cv2.fillConvexPoly(mask, hull, 1.0)
+
+                        # 3. 눈, 코, 입만 덮고 있으므로 이마와 턱을 덮기 위해 마스크 팽창(Dilation)
+                        # ※ 합성 결과의 테두리가 어색하면 kernel 크기(현재 50x50)를 조절하세요.
+                        kernel = np.ones((50, 50), np.uint8)
+                        mask = cv2.dilate(mask, kernel, iterations=1)
+
+                        # 4. 가우시안 블러로 자연스러운 경계선(페더링) 처리
+                        blend_mask_base = gaussian_filter(mask, sigma=12)
+                        blend_mask_base = np.expand_dims(blend_mask_base, axis=-1)
 
                         # blend swapped face with target image
                         blend_mask = cv2.warpAffine(blend_mask_base, iM, im_shape, borderValue=0.0)
