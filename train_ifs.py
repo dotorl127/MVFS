@@ -258,7 +258,7 @@ def run_validation(models, vae, text_embedding, batch, device, save_dir, step):
     # FaceNet features
     facenet_features = models["facenet"](
         a1_latent,
-        timesteps,
+        torch.zeros_like(timesteps),
         text_embedding.expand(B, -1, -1),
     )
 
@@ -347,7 +347,10 @@ def train(args):
     models["id_adapter"].train()
 
     optimizer.zero_grad()
-    loss_accum = {"total": 0, "rec": 0, "id": 0, "dm": 0}
+    loss_accum = {"total": 0,
+                  "rec": 0,
+                  "id": 0,
+                  "dm": 0}
 
     pbar = tqdm(total=args.max_steps, initial=global_step)
 
@@ -386,7 +389,7 @@ def train(args):
                 # 4. FaceNet: A1 pixel-level features (no_grad 내부 처리)
                 facenet_features = models["facenet"](
                     a1_latent,
-                    timesteps,
+                    torch.zeros_like(timesteps),
                     text_embedding.expand(B, -1, -1),
                 )
 

@@ -90,7 +90,9 @@ class TotalLoss(nn.Module):
         l_id = self.id_loss(generated_embedding, source_embedding)
         l_dm = self.diff_loss(noise_pred, noise_target)
 
-        total = l_rec + l_id + l_dm
+        total = (l_rec
+                 + l_id
+                 + l_dm)
 
         return {
             "total": total,

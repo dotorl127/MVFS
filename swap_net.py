@@ -1,24 +1,51 @@
 """
-SwapNet: SD-Turbo UNet 기반 face swap 생성 주체
-FaceNet: SwapNet 가중치 복사본, ref pixel-level ID feature 추출 후 SwapNet self-attention에 주입
-
 DreamID 논문 구조:
-  - FaceNet feature (h) + SwapNet feature (h) → concat (2h) → self-attention → 앞쪽 h만 SwapNet으로 전달
-  - ID Adapter feature → SwapNet cross-attention KV에 추가
+
+FaceNet:
+  - SwapNet과 동일한 UNet 구조 (전체, encoder+decoder)
+  - ref A1 latent 입력 (4채널)
+  - 각 attn1 레이어의 hidden_states를 hook으로 수집
+  - 기본 attention processor 사용 (FaceNetAttentionProcessor 아님)
+
+SwapNet:
+  - SD-Turbo UNet (전체)
+  - 입력: [noisy(4ch) | ε(B')(4ch)] concat → 8채널
+  - FaceNetAttentionProcessor 등록
+  - 각 attn1 레이어에서:
+      FaceNet feature(h) + SwapNet feature(h) → concat(2h)
+      → self-attention
+      → FaceNet feature(h)만 output으로 전달 (논문: pixel-level ID Features)
+  - 각 attn2 레이어에서:
+      text + id_features → KV concat → cross-attention
 """
 
 import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
-from diffusers.models.attention_processor import Attention
-import xformers.ops as xops
+from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from copy import deepcopy
 from typing import Optional, List
 
-# ─────────────────────────────────────────────
-# FaceNet feature를 self-attention에 주입하는 custom processor
-# ─────────────────────────────────────────────
+try:
+    import xformers.ops as xops
+    USE_XFORMERS = True
+except ImportError:
+    USE_XFORMERS = False
+
+
 class FaceNetAttentionProcessor:
+    """
+    SwapNet의 각 attention layer에 등록되는 processor
+
+    attn1 (self-attention):
+        FaceNet feature(h) + SwapNet feature(h) → concat(2h)
+        → self-attention
+        → FaceNet feature 부분(h)만 output (pixel-level ID Features)
+
+    attn2 (cross-attention):
+        text + id_features → KV concat → cross-attention
+    """
+
     def __init__(self, layer_idx: int):
         self.layer_idx = layer_idx
 
@@ -33,11 +60,10 @@ class FaceNetAttentionProcessor:
         **kwargs,
     ) -> torch.Tensor:
 
-        USE_XFORMERS = True
+        is_cross = encoder_hidden_states is not None
 
-        is_cross_attention = encoder_hidden_states is not None
-
-        if is_cross_attention:
+        if is_cross:
+            # ── attn2: text + id_features KV concat ──
             query = attn.to_q(hidden_states)
             key = attn.to_k(encoder_hidden_states)
             value = attn.to_v(encoder_hidden_states)
@@ -53,7 +79,6 @@ class FaceNetAttentionProcessor:
             value = attn.head_to_batch_dim(value)
 
             if USE_XFORMERS:
-                # xformers: [B*heads, S, head_dim] → [B*heads, S, head_dim]
                 hidden_states = xops.memory_efficient_attention(query, key, value)
             else:
                 attention_probs = attn.get_attention_scores(query, key, attention_mask)
@@ -64,34 +89,56 @@ class FaceNetAttentionProcessor:
             hidden_states = attn.to_out[1](hidden_states)
 
         else:
+            # ── attn1: FaceNet feature concat → self-attention ──
+            facenet_feat = None
             if (
                 facenet_features is not None
                 and self.layer_idx < len(facenet_features)
-                and facenet_features[self.layer_idx] is not None
             ):
-                facenet_feat = facenet_features[self.layer_idx]
-                if facenet_feat.shape == hidden_states.shape:
-                    concat_states = torch.cat([hidden_states, facenet_feat], dim=1)
+                f = facenet_features[self.layer_idx]
+                if f is not None and f.shape == hidden_states.shape:
+                    facenet_feat = f
+
+            if facenet_feat is not None:
+                # [FaceNet(h) | SwapNet(h)] → 2h
+                concat_states = torch.cat([facenet_feat, hidden_states], dim=1)
+
+                # query: FaceNet feature (h)
+                # key/value: concat (2h)
+                query = attn.to_q(facenet_feat)
+                key = attn.to_k(concat_states)
+                value = attn.to_v(concat_states)
+
+                query = attn.head_to_batch_dim(query)
+                key = attn.head_to_batch_dim(key)
+                value = attn.head_to_batch_dim(value)
+
+                if USE_XFORMERS:
+                    hidden_states = xops.memory_efficient_attention(query, key, value)
                 else:
-                    concat_states = hidden_states
+                    attention_probs = attn.get_attention_scores(query, key, attention_mask)
+                    hidden_states = torch.bmm(attention_probs, value)
+
+                hidden_states = attn.batch_to_head_dim(hidden_states)
+
             else:
-                concat_states = hidden_states
+                # FaceNet feature 없을 때 일반 self-attention
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(hidden_states)
+                value = attn.to_v(hidden_states)
 
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(concat_states)
-            value = attn.to_v(concat_states)
+                query = attn.head_to_batch_dim(query)
+                key = attn.head_to_batch_dim(key)
+                value = attn.head_to_batch_dim(value)
 
-            query = attn.head_to_batch_dim(query)
-            key = attn.head_to_batch_dim(key)
-            value = attn.head_to_batch_dim(value)
+                if USE_XFORMERS:
+                    hidden_states = xops.memory_efficient_attention(query, key, value)
+                else:
+                    attention_probs = attn.get_attention_scores(query, key, attention_mask)
+                    hidden_states = torch.bmm(attention_probs, value)
 
-            if USE_XFORMERS:
-                hidden_states = xops.memory_efficient_attention(query, key, value)
-            else:
-                attention_probs = attn.get_attention_scores(query, key, attention_mask)
-                hidden_states = torch.bmm(attention_probs, value)
+                hidden_states = attn.batch_to_head_dim(hidden_states)
 
-            hidden_states = attn.batch_to_head_dim(hidden_states)
             hidden_states = attn.to_out[0](hidden_states)
             hidden_states = attn.to_out[1](hidden_states)
 
@@ -99,7 +146,7 @@ class FaceNetAttentionProcessor:
 
 
 def register_facenet_processors(unet: UNet2DConditionModel):
-    """UNet의 모든 Attention layer에 FaceNetAttentionProcessor 등록"""
+    """SwapNet UNet의 모든 Attention layer에 FaceNetAttentionProcessor 등록"""
     idx = 0
     for name, module in unet.named_modules():
         if isinstance(module, Attention):
@@ -107,29 +154,22 @@ def register_facenet_processors(unet: UNet2DConditionModel):
             idx += 1
 
 
-# ─────────────────────────────────────────────
-# FaceNet: ref 이미지 → pixel-level feature 추출
-# ─────────────────────────────────────────────
 class FaceNet(nn.Module):
     """
-    SwapNet UNet 가중치 복사본 (ReferenceNet 역할)
-    ref A1 → self-attention layer별 hidden_states 수집 후 SwapNet에 주입
-    FaceNet 자체도 학습 대상 (논문에서 Train 표시)
+    SwapNet과 동일한 UNet 구조
+    ref A1 → attn1 레이어별 hidden_states 수집 → SwapNet에 주입
+    기본 attention processor 사용 (FaceNetAttentionProcessor 아님)
     """
 
     def __init__(self, swapnet: "SwapNet"):
-        """
-        Args:
-            swapnet: 이미 _expand_input_channels된 SwapNet 인스턴스
-                     SwapNet.unet (8채널) 을 deepcopy 후 4채널로 리셋
-        """
         super().__init__()
-        # SwapNet의 8채널 UNet을 복사 후 4채널로 리셋
         self.unet = deepcopy(swapnet.unet)
         self._reset_input_channels()
+        # FaceNet은 기본 processor 사용 (FaceNetAttentionProcessor 제거)
+        self.unet.set_attn_processor(AttnProcessor2_0())
 
     def _reset_input_channels(self):
-        """FaceNet은 ref latent 4채널만 받음 (8채널 conv_in → 4채널)"""
+        """8채널 conv_in → 4채널 (ref latent만 입력)"""
         old_conv = self.unet.conv_in
         new_conv = nn.Conv2d(
             4,
@@ -138,7 +178,6 @@ class FaceNet(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding,
         )
-        # 8채널 중 앞 4채널 가중치만 복사
         new_conv.weight.data = old_conv.weight.data[:, :4, :, :].clone()
         new_conv.bias.data = old_conv.bias.data.clone()
         self.unet.conv_in = new_conv
@@ -150,20 +189,16 @@ class FaceNet(nn.Module):
         encoder_hidden_states: torch.Tensor,
     ) -> List[torch.Tensor]:
         """
-        forward hook으로 각 self-attention (attn1) 의 input hidden_states 수집
-        FaceNet은 학습 가능하므로 no_grad 없이 실행
-
-        Returns:
-            features: List[Tensor] — attn1 레이어 순서대로 hidden_states
+        attn1 레이어의 hidden_states를 hook으로 수집
+        Returns: List[Tensor] — attn1 레이어 순서대로
         """
         features = []
         hooks = []
 
         def make_hook():
             def hook(module, args, output):
-                # Attention.__call__ 의 첫 번째 positional arg = hidden_states
                 if args:
-                    features.append(args[0])  # gradient 유지 (clone 제거)
+                    features.append(args[0])
             return hook
 
         for name, module in self.unet.named_modules():
@@ -182,13 +217,10 @@ class FaceNet(nn.Module):
         return features
 
 
-# ─────────────────────────────────────────────
-# SwapNet: face swap 생성 주체
-# ─────────────────────────────────────────────
 class SwapNet(nn.Module):
     """
-    SD-Turbo UNet 기반 SwapNet
-    입력: [noisy(4ch) | ε(B')(4ch)] concat → 8채널
+    SD-Turbo UNet 기반 face swap 생성 주체
+    입력: [noisy(4ch) | ε(B')(4ch)] → 8채널
     """
 
     def __init__(self, unet: UNet2DConditionModel):
@@ -197,11 +229,7 @@ class SwapNet(nn.Module):
         self._expand_input_channels()
         register_facenet_processors(self.unet)
 
-    def build_facenet(self) -> "FaceNet":
-        """
-        SwapNet 초기화 완료 후 FaceNet 생성
-        반드시 SwapNet 생성 후 호출: facenet = swapnet.build_facenet()
-        """
+    def build_facenet(self) -> FaceNet:
         return FaceNet(self)
 
     def _expand_input_channels(self):
@@ -228,17 +256,6 @@ class SwapNet(nn.Module):
         facenet_features: Optional[List[torch.Tensor]] = None,
         id_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            noisy_latent:          [B, 4, H, W] 순수 가우시안 노이즈 (t=999)
-            target_latent:         [B, 4, H, W] ε(B') VAE encoded
-            timestep:              [B] 999 고정
-            encoder_hidden_states: [B, seq, dim] text embedding
-            facenet_features:      List[Tensor] FaceNet self-attn hidden_states
-            id_features:           [B, num_tokens, dim] ID Adapter semantic features
-        Returns:
-            noise_pred: [B, 4, H, W]
-        """
         x = torch.cat([noisy_latent, target_latent], dim=1)  # [B, 8, H, W]
 
         return self.unet(
